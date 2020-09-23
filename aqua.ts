@@ -1,5 +1,6 @@
-import { serve, Server, ServerRequest, Response as ServerResponse } from "https://deno.land/std@v0.42.0/http/server.ts";
+import { serve, serveTLS, Server, ServerRequest, Response as ServerResponse } from "https://deno.land/std@0.69.0/http/server.ts";
 import Router from "./router.ts";
+import ContentHandler from "./content_handler.ts";
 
 type ResponseHandler = (req: Request) => (RawResponse | Promise<RawResponse>);
 type Method = "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH";
@@ -36,6 +37,7 @@ export interface Request {
     body: { [name: string]: string; };
     cookies: { [name: string]: string; };
     parameters: { [name: string]: string; };
+    matches: string[];
 }
 
 export interface Route {
@@ -45,53 +47,89 @@ export interface Route {
     responseHandler: ResponseHandler;
 }
 
+export interface RegexRoute {
+    path: RegExp;
+    responseHandler: ResponseHandler;
+}
+
+export interface StaticRoute {
+    folder: string;
+    path: string;
+}
+
 export interface Options {
     ignoreTrailingSlash?: boolean;
     log?: boolean;
+    tls?: {
+        independentPort?: number;
+        hostname?: string;
+        certFile: string;
+        keyFile: string;
+    }
 }
 
 export default class Aqua {
-    private readonly server: Server;
+    private readonly textDecoder: TextDecoder;
+    private readonly servers: Server[] = [];
     private routes: { [path: string]: Route } = {};
+    private regexRoutes: RegexRoute[] = [];
     private options: Options = {};
     private middlewares: Middleware[] = [];
+    private staticRoutes: StaticRoute[] = [];
+
     private fallbackHandler: ResponseHandler | null = null;
 
     constructor(port: number, options?: Options) {
-        this.server = serve({ port });
-        this.options = options || {};
+        const onlyTLS = (options?.tls && !options.tls.independentPort) || options?.tls?.independentPort === port;
 
-        this.handleRequests();
+        if (options?.tls) {
+            this.servers.push(serveTLS({
+                hostname: options.tls.hostname || "localhost",
+                certFile: options.tls.certFile || "./localhost.crt",
+                keyFile: options.tls.keyFile || "./localhost.key",
+                port: options.tls.independentPort || port
+            }));
+        }
+
+        if (!onlyTLS) this.servers.push(serve({ port }));
+
+        this.textDecoder = new TextDecoder();
+        this.options = options || {};
+        this.spinUpServers();
         if (this.options.log) console.log(`Server started (http://localhost:${port})`);
     }
 
     public async render(filePath: string): Promise<string> {
         try {
-            return new TextDecoder().decode(await Deno.readFile(filePath));
+            return this.textDecoder.decode(await Deno.readFile(filePath));
         }catch {
             return "Could not render file.";
         }
     }
 
     private async parseBody(req: ServerRequest): Promise<{ [name: string]: string; }> {
+        if (!req.contentLength) return {};
+
         const buffer: Uint8Array = new Uint8Array(req.contentLength || 0);
         const lengthRead: number = await req.body.read(buffer) || 0;
-        const rawBody: string = new TextDecoder().decode(buffer.subarray(0, lengthRead));
+        const rawBody: string = this.textDecoder.decode(buffer.subarray(0, lengthRead));
         let body: {} = {};
+
+        if (!rawBody) return {};
 
         try {
             body = JSON.parse(rawBody);
         }catch(error) {
             if (rawBody.includes(`name="`)) {
                 body = (rawBody.match(/name="(.*?)"(\s|\n|\r)*(.*)(\s|\n|\r)*---/gm) || [])
-                .reduce((fields: {}, field: string): {} => {
-                    if (!/name="(.*?)"/.exec(field)?.[1]) return fields;
+                    .reduce((fields: {}, field: string): {} => {
+                        if (!/name="(.*?)"/.exec(field)?.[1]) return fields;
 
-                    return {
-                        ...fields,
-                        [/name="(.*?)"/.exec(field)?.[1] || ""]: field.match(/(.*?)(?=(\s|\n|\r)*---)/)?.[0]
-                    }
-                }, {});
+                        return {
+                            ...fields,
+                            [/name="(.*?)"/.exec(field)?.[1] || ""]: field.match(/(.*?)(?=(\s|\n|\r)*---)/)?.[0]
+                        }
+                    }, {});
             }
         }
 
@@ -99,15 +137,16 @@ export default class Aqua {
     }
 
     private parseQuery(req: ServerRequest): { [name: string]: string; } {
-        const queryURL: string = req.url.includes("?") && req.url.replace(/(.*)\?/, "") || "";
-        const queryString: string[] = queryURL.split("&");
+        if (!req.url.includes("?")) return {};
+
+        const queryString: string[] = req.url.replace(/(.*)\?/, "").split("&");
 
         return queryString.reduce((queries: {}, query: string): {} => {
             if (!query || !query.split("=")?.[0] || query.split("=")?.[1] === undefined) return queries;
 
             return {
                 ...queries,
-                [query.split("=")?.[0]]: query.split("=")?.[1]
+                [decodeURIComponent(query.split("=")?.[0])]: decodeURIComponent(query.split("=")?.[1].replace(/\+/g, " "))
             }
         }, {}) || {};
     }
@@ -115,12 +154,14 @@ export default class Aqua {
     private parseCookies(req: ServerRequest): { [name: string]: string; } {
         const rawCookieString: string | null = req.headers.get("cookie");
 
-        return rawCookieString && rawCookieString.split(";").reduce((cookies: {}, cookie: string): {} => {
+        if (!rawCookieString) return {};
+
+        return rawCookieString.split(";").reduce((cookies: {}, cookie: string): {} => {
             return {
                 ...cookies,
                 [cookie.split("=")[0].trimLeft()]: cookie.split("=")[1]
             };
-        }, {}) || {};
+        }, {});
     }
 
     private connectURLParameters(route: Route, requestedPath: string): { [name: string]: string; } {
@@ -147,15 +188,21 @@ export default class Aqua {
         return typeof rawResponse === "string" ? { content: rawResponse } : rawResponse;
     }
 
-    private async respondToRequest(req: Request, requestedPath: string, route: Route, usesURLParameters: boolean = false) {
-         if (usesURLParameters) {
-            req.parameters = this.connectURLParameters(route, requestedPath);
+    private isRegexRoute(route: Route | RegexRoute): boolean {
+        return route.path instanceof RegExp;
+    }
+
+    private async respondToRequest(req: Request, requestedPath: string, route: Route | RegexRoute, usesURLParameters: boolean = false) {
+        if (usesURLParameters) {
+            req.parameters = this.connectURLParameters(route as Route, requestedPath);
 
             if (Object.values(req.parameters).find((parameterValue) => parameterValue === "") !== undefined) {
                 await this.respondWithNoRouteFound(req);
                 return;
             }
         }
+
+        if (this.isRegexRoute(route)) req.matches = (requestedPath.match(route.path) as string[]).slice(1) || [];
 
         const formattedResponse: Response = this.formatRawResponse(await route.responseHandler(req));
 
@@ -164,11 +211,11 @@ export default class Aqua {
             return;
         }
 
-        const responseAfterMiddlewares: Response = this.middlewares.reduce((currentResponse: Response, middleware: Middleware): Response => {
+        const responseAfterMiddlewares: Response = this.middlewares.length > 0 ? this.middlewares.reduce((currentResponse: Response, middleware: Middleware): Response => {
             if (!currentResponse) return currentResponse;
 
             return middleware(req, currentResponse);
-        }, formattedResponse);
+        }, formattedResponse) : formattedResponse;
         const headers: Headers = new Headers(formattedResponse.headers || {});
 
         if (formattedResponse.cookies) {
@@ -221,8 +268,26 @@ export default class Aqua {
         req.raw.respond({ status: 404, body: "No registered route found." });
     }
 
-    private async handleRequests() {
-        for await (const rawRequest of this.server) {
+    private spinUpServers() {
+        for (const server of this.servers) {
+            this.handleRequests(server);
+        }
+    }
+
+    private async respondToStaticRequest(req: Request, requestedPath: string, staticRoute: StaticRoute) {
+        const resourcePath: string = requestedPath.replace(staticRoute.path, "");
+        const extension: string = resourcePath.replace(/.*(?=\.[a-zA-Z0-9_]*$)/, "");
+        const contentType: string | null = extension ? ContentHandler.getContentType(extension) : null;
+
+        try {
+            req.raw.respond({ headers: contentType ? new Headers({ "Content-Type": contentType }) : new Headers(), body: await Deno.readFile(staticRoute.folder + resourcePath) });
+        }catch {
+            req.raw.respond({ status: 404, body: "File not found" });
+        }
+    }
+
+    private async handleRequests(server: Server) {
+        for await (const rawRequest of server) {
             if (this.options.ignoreTrailingSlash) rawRequest.url = rawRequest.url.replace(/\/$/, "") + "/";
 
             const req: Request = {
@@ -230,10 +295,11 @@ export default class Aqua {
                 url: rawRequest.url,
                 headers: rawRequest.headers,
                 method: (rawRequest.method.toUpperCase() as Method),
-                query: this.parseQuery(rawRequest),
-                body: await this.parseBody(rawRequest),
-                cookies: this.parseCookies(rawRequest),
-                parameters: {}
+                query: rawRequest.url.includes("?") ? this.parseQuery(rawRequest) : {},
+                body: rawRequest.contentLength ? await this.parseBody(rawRequest) : {},
+                cookies: rawRequest.headers.get("cookies") ? this.parseCookies(rawRequest) : {},
+                parameters: {},
+                matches: []
             };
             const requestedPath = Router.parseRequestPath(req.url);
 
@@ -250,9 +316,26 @@ export default class Aqua {
 
                 if (matchingRouteWithURLParameters) {
                     await this.respondToRequest(req, requestedPath, matchingRouteWithURLParameters, true);
-                }else {
-                    await this.respondWithNoRouteFound(req);
+                    continue;
                 }
+
+                const matchingRegexRoute = Router.findMatchingRegexRoute(requestedPath, this.regexRoutes);
+
+                if (matchingRegexRoute) {
+                    await this.respondToRequest(req, requestedPath, matchingRegexRoute as RegexRoute);
+                    continue;
+                }
+
+                if (req.method === "GET") {
+                    const matchingStaticRoute = Router.findMatchingStaticRoute(requestedPath, this.staticRoutes);
+
+                    if (matchingStaticRoute) {
+                        await this.respondToStaticRequest(req, requestedPath, matchingStaticRoute);
+                        continue;
+                    }
+                }
+
+                await this.respondWithNoRouteFound(req);
             }else {
                 await this.respondToRequest(req, requestedPath, this.routes[req.method + requestedPath]);
             }
@@ -269,7 +352,12 @@ export default class Aqua {
         return this;
     }
 
-    public route(path: string, method: Method, responseHandler: ResponseHandler): Aqua {
+    public route(path: string | RegExp, method: Method, responseHandler: ResponseHandler): Aqua {
+        if (path instanceof RegExp) {
+            this.regexRoutes.push({ path, responseHandler });
+            return this;
+        }
+
         if (!path.startsWith("/")) throw Error("Routes must start with a slash");
         if (this.options.ignoreTrailingSlash) path = path.replace(/\/$/, "") + "/";
 
@@ -284,13 +372,18 @@ export default class Aqua {
         return this;
     }
 
-    public get(path: string, responseHandler: ResponseHandler): Aqua {
+    public get(path: string | RegExp, responseHandler: ResponseHandler): Aqua {
         this.route(path, "GET", responseHandler);
         return this;
     }
 
-    public post(path: string, responseHandler: ResponseHandler): Aqua {
+    public post(path: string | RegExp, responseHandler: ResponseHandler): Aqua {
         this.route(path, "POST", responseHandler);
         return this;
+    }
+
+    public serve(folder: string, path: string) {
+        if (!path.startsWith("/")) throw Error("Routes must start with a slash");
+        this.staticRoutes.push({ folder: folder.replace(/\/$/, "") + "/", path: path.replace(/\/$/, "") + "/" });
     }
 }
